@@ -1,0 +1,11 @@
+# Copy to terraform.tfvars and edit. Every value here has a working default;
+# nothing in this file is secret.
+
+region          = "eu-central-1"
+cluster_name    = "liqo-gpu-hub"
+cluster_version = "1.36"
+vpc_cidr        = "10.10.0.0/16"
+# Cheap test shape: nodes in public subnets, no NAT gateway (~35 USD/month
+# saved on an otherwise idle pilot). Flip back to true before anything real.
+use_private_subnets = false
+node_instance_type = "t3.small"

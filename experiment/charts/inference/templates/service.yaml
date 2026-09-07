@@ -1,0 +1,35 @@
+{{- if .Values.vllm.enabled }}
+{{- if eq .Values.vllm.serviceName "vllm" }}
+{{- fail "vllm.serviceName must not be \"vllm\": the injected VLLM_PORT=tcp://… env var crashes the engine. Use vllm-svc." }}
+{{- end }}
+{{/*
+  ClusterIP is enough for every supported access path: the gateway proxies to
+  this Service from inside the cluster, and `kubectl port-forward` targets it
+  directly. `type` stays configurable only for the NLB option described in
+  values.yaml — nothing here needs a NodePort.
+*/}}
+{{- $type := .Values.vllm.service.type }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.vllm.serviceName }}
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    app: vllm
+  {{- with .Values.vllm.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $type }}
+  selector:
+    app: vllm
+  ports:
+    - name: http
+      port: {{ .Values.vllm.port }}
+      targetPort: {{ .Values.vllm.port }}
+      protocol: TCP
+      {{- if and .Values.vllm.service.nodePort (ne $type "ClusterIP") }}
+      nodePort: {{ .Values.vllm.service.nodePort }}
+      {{- end }}
+{{- end }}

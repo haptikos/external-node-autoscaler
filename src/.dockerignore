@@ -1,0 +1,4 @@
+# The image ships the operator and nothing else.
+README.md
+__pycache__/
+*.py[cod]

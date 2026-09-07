@@ -1,0 +1,91 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "external-node-autoscaler.fullname" . }}
+  labels:
+    {{- include "external-node-autoscaler.labels" . | nindent 4 }}
+rules:
+  # DEMAND: Unschedulable pending pods, and pods placed on virtual nodes.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # `liqoctl peer` waits for the gateway Deployment to become ready in the
+  # tenant namespace. Liqo grants exactly this in its own peering-user role
+  # (chart: files/liqo-peering-user-tenant-ns-ClusterRole.yaml, `apps/deployments:
+  # [get]`); list/watch are added because the wait may poll either way.
+  #
+  # Omitting it does not fail early or clearly — the handshake gets all the way
+  # through "Gateway server correctly set up" and then dies on the client side,
+  # which reads as a networking fault rather than an RBAC one:
+  #   deployments.apps "gw-<machine>" is forbidden
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+  # SUPPLY: virtual nodes are the workers now, so this is the whole accounting
+  # story — no second kubeconfig needed to know what capacity exists.
+  #
+  # `delete` is not optional: force_teardown() has to remove the Node object
+  # itself, because it is cluster-scoped and outlives its tenant namespace
+  # whenever the VirtualNode finalizer could not run. Without it teardown logs
+  # "node delete failed: 403" and leaks an orphan Node — and an orphan puts the
+  # VirtualNode and NamespaceMap counts out of step, which makes Liqo's
+  # NamespaceOffloading controller refuse to configure mappings for EVERY
+  # cluster, healthy ones included.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "delete"]
+  # Tenant namespaces are created by the peering and removed by teardown.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "create", "delete"]
+  # Peering lifecycle. `liqoctl peer` runs the full handshake as this identity:
+  # networking (gateway client, configuration, public keys), authentication
+  # (tenant, identity, secrets) and offloading (virtual node). Narrower rules
+  # fail partway through a peering and leave half-built state behind, which is
+  # worse than a broad grant here.
+  - apiGroups: ["core.liqo.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: ["authentication.liqo.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: ["offloading.liqo.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: ["networking.liqo.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: ["ipam.liqo.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  # liqoctl reads the local cluster identity from a ConfigMap in the liqo
+  # namespace, and stores peering credentials as Secrets in tenant namespaces.
+  # `watch` is in Liqo's own liqo-ns peering role for configmaps; the rest get
+  # it too because the handshake polls several of these while waiting.
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets", "services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # The peering grants the remote cluster scoped access to this one.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list", "create", "update", "patch", "delete", "bind", "escalate"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "external-node-autoscaler.fullname" . }}
+  labels:
+    {{- include "external-node-autoscaler.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "external-node-autoscaler.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "external-node-autoscaler.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

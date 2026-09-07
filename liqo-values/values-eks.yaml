@@ -1,0 +1,77 @@
+# Liqo v1.2.0 — hub (consumer) values for EKS.
+#
+# This is the file equivalent of `liqoctl install eks --only-output-values`,
+# with the cluster-specific bits left blank because the Makefile fills them
+# from terraform outputs:
+#
+#   apiServer.address    <- terraform output cluster_endpoint
+#   ipam.podCIDR         <- terraform output vpc_cidr          (VPC CNI: pods get VPC IPs)
+#   ipam.serviceCIDR     <- terraform output cluster_service_cidr
+#
+# Install:
+#   helm upgrade --install liqo liqo/liqo --version v1.2.0 \
+#     --namespace liqo --create-namespace \
+#     -f liqo/values-eks.yaml --set apiServer.address=... (see Makefile)
+#
+# VERSION LOCK: the liqoctl binary MUST be the same version as this chart, on
+# BOTH clusters. liqoctl v1.2.0 against a v1.1 install (or the reverse) fails
+# in confusing ways during peering. See the README.
+
+apiServer:
+  # Filled by the Makefile with the EKS API endpoint. It must be reachable from
+  # the K3s cluster, so the hub keeps a public endpoint.
+  address: ""
+  trustedCA: false
+
+discovery:
+  config:
+    clusterID: hub
+    clusterLabels:
+      liqo.io/provider: aws
+      topology.kubernetes.io/region: eu-central-1
+
+ipam:
+  # Filled by the Makefile.
+  podCIDR: ""
+  serviceCIDR: ""
+  reservedSubnets: []
+
+networking:
+  enabled: true
+  reflectIPs: true
+
+  gatewayTemplates:
+    server:
+      service:
+        annotations:
+          service.beta.kubernetes.io/aws-load-balancer-type: nlb
+
+  fabric:
+    config:
+      # EKS nodeports masquerade incoming traffic behind a PodCIDR address;
+      # without full masquerade the return path breaks.
+      fullMasquerade: true
+
+authentication:
+  enabled: true
+
+offloading:
+  enabled: true
+
+virtualKubelet:
+  extra:
+    # `aws` is the EKS-specific path (the beta.eks.amazonaws.com/app-serving
+    # signer, which does issue to service accounts). Fall back to `self-signed`
+    # if that signer is unavailable: the EKS apiserver sets no
+    # --kubelet-certificate-authority, so it does not verify the chain.
+    args:
+      - --certificate-type=aws
+
+# Off by default; the pilot has no Prometheus operator.
+metrics:
+  enabled: false
+  prometheusOperator:
+    enabled: false
+
+telemetry:
+  enabled: false

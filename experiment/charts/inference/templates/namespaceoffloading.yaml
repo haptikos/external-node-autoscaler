@@ -1,0 +1,26 @@
+{{- if .Values.offloading.enabled }}
+apiVersion: offloading.liqo.io/v1beta1
+kind: NamespaceOffloading
+metadata:
+  name: {{ .Values.offloading.name }}
+  namespace: {{ .Values.namespace.name }}
+spec:
+  podOffloadingStrategy: {{ .Values.offloading.podOffloadingStrategy }}
+  namespaceMappingStrategy: {{ .Values.offloading.namespaceMappingStrategy }}
+  {{- /*
+    Always emit clusterSelector WITH nodeSelectorTerms, even when empty.
+
+    Never `clusterSelector: {}` — the CRD marks nodeSelectorTerms required
+    within the object, so a bare empty object is rejected outright:
+      missing required field "nodeSelectorTerms" in ...spec.clusterSelector
+
+    And prefer `nodeSelectorTerms: []` over omitting the whole field, because
+    that is the shape `liqoctl offload namespace` produces with no --selector.
+  */}}
+  clusterSelector:
+    nodeSelectorTerms:
+      {{- with .Values.offloading.clusterSelector.nodeSelectorTerms }}
+      {{- toYaml . | nindent 6 }}
+      {{- else }} []
+      {{- end }}
+{{- end }}

@@ -1,0 +1,90 @@
+# Goes in the external-node-autoscaler chart values, passed through verbatim — so
+# these keys are documented here, next to the code that reads them
+# (providers/vultr/config.py). The ACCOUNT is a `providers` entry; what to RENT
+# is per pool.
+#
+# NOTHING SECRET HERE. The API key is a pre-created Secret named by
+# `credentialsSecret`, injected with envFrom as VULTR_API_KEY.
+#
+# THE PLAN IDS BELOW ARE ILLUSTRATIVE. Vultr's catalog changes and not every
+# plan is sold in every region, so list your own before copying these:
+#   curl -H "Authorization: Bearer $VULTR_API_KEY" \
+#        'https://api.vultr.com/v2/plans?type=all&per_page=500' \
+#     | jq -r '.plans[] | [.id, .vcpu_count, .ram, (.gpu_type // "-")] | @tsv'
+# A plan not sold in the pool's region is named in a startup warning and never
+# rented.
+
+providers:
+  - name: vultr
+    credentialsSecret: vultr-creds
+
+    # Instances to create per reconcile pass, SHARED by every pool renting from
+    # this account. Do not raise it much: each create is a blocking API call,
+    # and this is the blast radius of a bad provision script.
+    batchSize: 50
+
+    config:
+      # Default region. A pool may override it — Vultr sells GPU plans in only
+      # a few locations, so a GPU pool is usually a region override.
+      region: ewr
+
+      # Resolved to an os_id by substring match, once, at startup. If the match
+      # is ambiguous the operator logs every candidate and uses the first; pin
+      # it with osId to remove the doubt.
+      osName: "Ubuntu 24.04"
+      # osId: 2284
+
+      # The provisioning script. Defaults to the shared providers/provision.sh
+      # that ships in the image; an absolute path is honoured as given, so a
+      # mounted ConfigMap can override it for hot-patching.
+      # provisionScript: /config/provision.sh
+
+pools:
+  # A CPU pool on Shared CPU plans — the cheapest thing that boots k3s.
+  - name: cpu-dryrun
+    nodeLabels:
+      byon/pool: cpu-dryrun
+    taints:
+      - key: byon/pool
+        value: cpu-dryrun
+        effect: NoSchedule
+    providers:
+      - name: vultr
+
+        # Ascending: the lowest priority entry is tried first, and a provider
+        # with no stock falls through to the next in the same pass. This is how
+        # you run Vultr alongside OVH — give each a priority and the pool walks
+        # them in order.
+        priority: 10
+
+        # Priority order, first with stock wins. Vultr's own word for a machine
+        # type is "plan", but the KEY is `flavors` here as in every provider —
+        # `plans` is rejected at startup so the two cannot drift apart.
+        # local_storage flavors. A block-storage-only one (the vx1
+        # `block_storage` half) cannot boot without a volume attached and is
+        # excluded by the provider, with a line saying so at startup.
+        flavors:
+          - vc2-2c-4gb
+          - vc2-4c-8gb
+
+        # No NVIDIA driver, container toolkit, device plugin or wait for an
+        # allocatable GPU.
+        gpu: false
+
+  # A GPU pool. Cloud GPU plans are ordinary VMs, so the standard driver install
+  # in provision.sh works — on FULL-GPU plans. See README.md: fractional vGPU
+  # plans need a guest driver that is not in Ubuntu's apt repo.
+  - name: gpu-l40s
+    nodeLabels:
+      byon/pool: gpu-l40s
+    taints:
+      - key: byon/pool
+        value: gpu-l40s
+        effect: NoSchedule
+    providers:
+      - name: vultr
+        priority: 10
+        region: ewr
+        flavors:
+          - vcg-l40s-16c-128g-48vram
+        gpu: true

@@ -1,0 +1,230 @@
+{{- if and .Values.vllm.enabled .Values.gateway.enabled }}
+{{/*
+  Public entry point for the offloaded model, as ONE unit:
+
+    internet -> ALB (ip targets) -> gateway pod -> vllm-svc -> Liqo tunnel -> pod on OVH
+
+  WHY A PROXY POD AND NOT AN ALB POINTED AT vllm-svc DIRECTLY
+
+  An ALB can register targets two ways. `ip` mode registers POD addresses, which
+  is the normal choice on EKS because the VPC CNI hands pods real VPC addresses.
+  That is impossible for the vLLM pod: it executes on the OVH K3s box, so the
+  address the hub reports for it (10.42.x.x) belongs to the REMOTE cluster's pod
+  CIDR and is reachable only from inside the Liqo tunnel. The ALB is an AWS
+  appliance in the VPC with no route into that tunnel, so those targets would be
+  permanently unhealthy while vLLM serves perfectly.
+
+  `instance` mode works — it targets the hub nodes on a NodePort and lets
+  kube-proxy make the tunnel hop — at the cost of a NodePort plus
+  controller-managed rules on the node security group.
+
+  This gateway removes both. It is an ordinary pod on a hub node, so it HAS a
+  VPC address the ALB can target in ip mode, and it reaches vllm-svc the same
+  way any in-cluster client does. No NodePort anywhere.
+
+  WHY ITS OWN NAMESPACE
+
+  It cannot live in the offloaded namespace. That namespace carries
+  podOffloadingStrategy: Remote, so anything created there is forced onto a
+  virtual node — this proxy would execute on OVH, and an ALB could not reach it
+  either. A separate, non-offloaded namespace is what keeps it on the hub.
+*/}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/name: vllm-gateway
+    app.kubernetes.io/part-of: inference
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-gateway
+  namespace: {{ .Values.gateway.namespace }}
+data:
+  nginx.conf: |
+    worker_processes auto;
+    error_log /dev/stderr warn;
+    pid /tmp/nginx.pid;
+
+    events { worker_connections 2048; }
+
+    http {
+      access_log /dev/stdout;
+
+      # Alpine's nginx defaults write here; the unprivileged image cannot use
+      # /var/cache/nginx.
+      client_body_temp_path /tmp/client_body;
+      proxy_temp_path       /tmp/proxy;
+      fastcgi_temp_path     /tmp/fastcgi;
+      uwsgi_temp_path       /tmp/uwsgi;
+      scgi_temp_path        /tmp/scgi;
+
+      # Resolve the backend at request time, not once at startup. A static
+      # hostname in proxy_pass is resolved when the worker boots and then cached
+      # for the process lifetime — which survives a helm reinstall of the
+      # inference chart handing vllm-svc a NEW ClusterIP, leaving this proxy
+      # talking to an address that routes nowhere until someone restarts it.
+      resolver {{ .Values.gateway.resolver }} valid=10s ipv6=off;
+
+      server {
+        listen {{ .Values.gateway.containerPort }};
+
+        # The ALB health-checks THIS, not the model. Proxy liveness and backend
+        # liveness are deliberately separate: if the health check followed vLLM,
+        # then every time the GPU machine is away (out of stock, cold start,
+        # recycled) the ALB would deregister this pod and answer its own opaque
+        # 503. Answering 200 here keeps the target healthy so the request
+        # reaches nginx and you get a 502 naming a real upstream failure.
+        location = /healthz {
+          access_log off;
+          add_header Content-Type text/plain always;
+          return 200 'gateway ok\n';
+        }
+
+        location / {
+          set $backend "{{ .Values.vllm.serviceName }}.{{ .Values.namespace.name }}.svc.cluster.local";
+          proxy_pass http://$backend:{{ .Values.vllm.port }};
+
+          proxy_http_version 1.1;
+          proxy_set_header Host              $host;
+          proxy_set_header X-Real-IP         $remote_addr;
+          proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+
+          # LLM traffic, not web traffic. Buffering on would hold a streamed
+          # completion until it finished, turning token-by-token SSE into one
+          # long pause and a burst — and the default 60s read timeout would kill
+          # any generation slower than that mid-stream.
+          proxy_buffering off;
+          proxy_request_buffering off;
+          proxy_read_timeout {{ .Values.gateway.proxyTimeout }};
+          proxy_send_timeout {{ .Values.gateway.proxyTimeout }};
+
+          # Prompts are large. The 1m default rejects long contexts with a 413
+          # that looks like a model error.
+          client_max_body_size {{ .Values.gateway.maxBodySize }};
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-gateway
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app: vllm-gateway
+spec:
+  replicas: {{ .Values.gateway.replicas }}
+  selector:
+    matchLabels:
+      app: vllm-gateway
+  template:
+    metadata:
+      labels:
+        app: vllm-gateway
+      annotations:
+        # Rolls the pod when the proxy config changes. Hashes the VALUES that
+        # render nginx.conf rather than the rendered template — the ConfigMap
+        # lives in this same file, so including it here would recurse.
+        checksum/config: {{ printf "%s|%s|%d" (toYaml .Values.gateway) .Values.vllm.serviceName (int .Values.vllm.port) | sha256sum }}
+    spec:
+      # Belt and braces: this namespace is not offloaded, so nothing pushes the
+      # pod remote — but a virtual node still advertises schedulable capacity,
+      # and a gateway that landed on the GPU box would be unreachable from the
+      # ALB and would burn a pod slot from the ResourceSlice.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: liqo.io/type
+                    operator: NotIn
+                    values: ["virtual-node"]
+      containers:
+        - name: nginx
+          image: "{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag }}"
+          imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.gateway.containerPort }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: vllm-gateway
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-gateway
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app: vllm-gateway
+spec:
+  # ClusterIP is correct even though an ALB fronts it: in ip mode the ALB
+  # registers the pod addresses behind this Service and never uses the Service
+  # IP or any node port.
+  type: ClusterIP
+  selector:
+    app: vllm-gateway
+  ports:
+    - name: http
+      port: {{ .Values.gateway.containerPort }}
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vllm-gateway
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app: vllm-gateway
+  annotations:
+    {{- toYaml .Values.gateway.ingress.annotations | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.gateway.ingress.className }}
+  rules:
+    {{- if .Values.gateway.ingress.host }}
+    - host: {{ .Values.gateway.ingress.host | quote }}
+      http:
+    {{- else }}
+    - http:
+    {{- end }}
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: vllm-gateway
+                port:
+                  number: {{ .Values.gateway.containerPort }}
+{{- end }}

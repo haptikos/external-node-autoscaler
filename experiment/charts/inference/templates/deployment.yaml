@@ -1,0 +1,131 @@
+{{- if .Values.vllm.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    app: vllm
+spec:
+  replicas: {{ .Values.vllm.replicas }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+        {{- with .Values.vllm.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Liqo passes this through to the remote pod. Without it the K3s
+        # kubelet uses the default runtime and the container never sees a GPU.
+        liqo.io/remote-runtime-class-name: nvidia
+        {{- with .Values.vllm.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      # A Service named "vllm" in this namespace would inject
+      # VLLM_PORT=tcp://10.x.x.x:8000 into the container. vLLM reads VLLM_PORT
+      # as an int and crashes on startup. Turning service links off removes the
+      # whole class of collision, not just this one.
+      enableServiceLinks: false
+
+      {{- $ns := .Values.vllm.nodeSelector | default dict }}
+      {{- if .Values.vllm.forceRemoteScheduling }}
+      {{- $ns = merge (dict "liqo.io/type" "virtual-node") $ns }}
+      {{- end }}
+      {{- with $ns }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if or .Values.vllm.forceRemoteScheduling .Values.vllm.poolTolerations }}
+      tolerations:
+        {{- if .Values.vllm.forceRemoteScheduling }}
+        # Virtual nodes are tainted, and Liqo's webhook only injects this once
+        # the namespace is labelled `liqo.io/scheduling-enabled`. It does NOT
+        # weaken the eviction policy: the virtual-node taint only, never
+        # not-ready or unreachable.
+        - key: virtual-node.liqo.io/not-allowed
+          operator: Exists
+          effect: NoExecute
+        {{- end }}
+        {{- with .Values.vllm.poolTolerations }}
+        # One per taint on the selected pool. Without these the pod matches no
+        # pool at all: the autoscaler reports it unroutable and rents nothing,
+        # and the scheduler would refuse the node even if one existed.
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: vllm
+          image: "{{ .Values.vllm.image.repository }}:{{ .Values.vllm.image.tag }}"
+          imagePullPolicy: {{ .Values.vllm.image.pullPolicy }}
+          args:
+            - --model
+            - {{ .Values.vllm.model | quote }}
+            - --host
+            - "0.0.0.0"
+            - --port
+            - {{ .Values.vllm.port | quote }}
+            {{- with .Values.vllm.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.vllm.port }}
+              protocol: TCP
+          env:
+            {{- if .Values.vllm.modelCache.enabled }}
+            - name: HF_HOME
+              value: {{ .Values.vllm.modelCache.hostPath | quote }}
+            {{- end }}
+            {{- if .Values.vllm.hfToken.enabled }}
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.vllm.hfToken.secretName }}
+                  key: {{ .Values.vllm.hfToken.secretKey }}
+            {{- end }}
+          # Cold-cache model download plus engine warmup is measured in minutes,
+          # not seconds. The startup probe holds the liveness/readiness gates
+          # open for failureThreshold × periodSeconds.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: {{ .Values.vllm.startupProbe.failureThreshold }}
+            periodSeconds: {{ .Values.vllm.startupProbe.periodSeconds }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: {{ .Values.vllm.readinessProbe.periodSeconds }}
+            failureThreshold: {{ .Values.vllm.readinessProbe.failureThreshold }}
+          resources:
+            {{- toYaml .Values.vllm.resources | nindent 12 }}
+          volumeMounts:
+            {{- if .Values.vllm.modelCache.enabled }}
+            - name: models
+              mountPath: {{ .Values.vllm.modelCache.hostPath }}
+            {{- end }}
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        {{- if .Values.vllm.modelCache.enabled }}
+        # hostPath on the provider worker. providers/provision.sh creates it
+        # during cloud-init, so a fresh machine already has it.
+        - name: models
+          hostPath:
+            path: {{ .Values.vllm.modelCache.hostPath }}
+            type: DirectoryOrCreate
+        {{- end }}
+        # vLLM's tensor-parallel workers need more than the default 64MB.
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+{{- end }}

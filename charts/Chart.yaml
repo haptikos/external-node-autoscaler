@@ -1,0 +1,11 @@
+apiVersion: v2
+name: external-node-autoscaler
+description: Demand-driven operator that rents OVH machines and attaches them to the hub as Liqo virtual nodes.
+type: application
+# PLACEHOLDERS, not the released version. Releases are versioned by the
+# `chart-v*` / `autoscaler-v*` tag history and stamped in by CI at package
+# time (`helm package --version --app-version`), so a real number here
+# would be stale the moment it was written. `helm show chart` on the
+# published chart, or the Releases page, is the source of truth.
+version: 0.0.0-dev
+appVersion: "dev"

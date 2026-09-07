@@ -1,0 +1,12 @@
+# Core dependencies — what the operator needs regardless of which node provider
+# is selected. Each provider pins its own in providers/<name>/requirements.txt,
+# so adding a node source never means editing this file or the Dockerfile.
+#
+# Pinned so a rebuild months from now produces the same operator.
+kubernetes==31.0.0
+PyYAML==6.0.2
+# Per-machine certificate authorities (pki.py). Ships manylinux wheels, so this
+# needs no build toolchain in the image. Chosen over shelling out to openssl
+# because the container runs read-only-root as uid 65532: openssl would mean
+# writing CA private keys to /tmp for no reason, where this keeps them in memory.
+cryptography==50.0.0

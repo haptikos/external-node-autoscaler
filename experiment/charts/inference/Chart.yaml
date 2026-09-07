@@ -1,0 +1,6 @@
+apiVersion: v2
+name: inference
+description: Offloaded namespace, the vLLM workload that runs on OVH GPUs through Liqo, and a CPU-only stand-in for testing the same loop without an accelerator.
+type: application
+version: 0.1.0
+appVersion: "0.25.1"

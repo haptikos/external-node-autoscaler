@@ -1,0 +1,95 @@
+# Copy to values.local.yaml (gitignored) and fill in your environment.
+# The Makefile picks it up automatically for `make autoscaler` / `make up`.
+
+providers:
+  # A directory under src/autoscaler/providers/. One entry
+  # per provider TYPE: credentials arrive as environment variables, so two OVH
+  # entries would share one account.
+  - name: ovh
+    credentialsSecret: ovh-creds
+
+    # The account, passed through untouched. Full set and defaults:
+    # providers/ovh/values.example.yaml
+    config:
+      # OVH public cloud project id (the 32-char hex service name).
+      project: "REPLACE-ME"
+      region: GRA11
+
+  # A SECOND PROVIDER is this and a pool entry naming it. Nothing else changes.
+  # Vultr scopes everything by the API key, so unlike OVH there is no project or
+  # account id to set here — an empty config is legitimate.
+  - name: vultr
+    credentialsSecret: vultr-creds        # one key: VULTR_API_KEY
+    batchSize: 50
+    config:
+      # ewr is New York (NJ). Vultr sells GPU plans in a few regions only, so a
+      # GPU pool is usually a region override on the pool entry.
+      region: ewr
+
+pools:
+  # A pod reaches a pool with `nodeSelector` plus a matching toleration. Declare
+  # them all and leave them: an idle pool rents nothing, so which one gets used
+  # is decided entirely by the workload's nodeSelector.
+  - name: gpu
+    nodeLabels:
+      byon/pool: gpu
+    taints:
+      - key: byon/pool
+        value: gpu
+        effect: NoSchedule
+    minMachines: 0
+    maxMachines: 3
+    providers:
+      # Tried in ascending priority: OVH first, Vultr when OVH has no stock —
+      # which for GPUs is often, so the fall-through is exercised for real.
+      - name: ovh
+        priority: 10
+        # First available wins. Prefer large instances: each machine carries its
+        # own K3s control plane and Liqo alongside the workload.
+        flavors:
+          - a10-45
+          - rtx5000-28
+        gpu: true
+
+      # Two cards in one pool is a trade. Different VRAM (24GB vs 48GB) both
+      # advertise nvidia.com/gpu: 1 and nothing in the model expresses the
+      # difference, so size workloads for the SMALLER card. cpu and memory need
+      # no such care — the packer picks whichever listed machine fits the pod.
+      - name: vultr
+        priority: 20
+        region: lhr           # this plan is sold in London, not the account ewr
+        flavors:
+          - vcg-a40-24c-120g-48vram
+        gpu: true
+
+  - name: cpu-dryrun
+    nodeLabels:
+      byon/pool: cpu-dryrun
+    taints:
+      - key: byon/pool
+        value: cpu-dryrun
+        effect: NoSchedule
+    maxMachines: 10
+    providers:
+      # Tried in ASCENDING priority, so the lower number is tried first and the
+      # other is the fall-through when it has no stock. Two providers in one
+      # pool only makes sense when their machines are close in size — these are
+      # both 2 vCPU / 8 GB, which is why this pool is the sane place to prove
+      # multi-provider scaling.
+      - name: ovh
+        priority: 10
+        flavors:
+          - d2-8
+        # Skips the whole NVIDIA stack, so machines join in ~2 minutes.
+        gpu: false
+      - name: vultr
+        priority: 20
+        flavors:
+          - vx1-g-2c-8g-120s
+        gpu: false
+
+config:
+  # Fleet-wide; per-pool ceilings apply on top and the tighter one wins. 0 means
+  # NO LIMIT (the chart default) — set a real number to cap spend. It is not the
+  # way to stop renting; that is config.drain.
+  maxMachines: 30

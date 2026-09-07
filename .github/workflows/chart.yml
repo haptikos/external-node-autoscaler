@@ -1,0 +1,209 @@
+# Lint, render and publish charts/ as an OCI chart in GHCR.
+name: external-node-autoscaler-chart
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'charts/**'
+      - '.github/workflows/chart.yml'
+  pull_request:
+    paths:
+      - 'charts/**'
+      - '.github/workflows/chart.yml'
+  workflow_call:
+    inputs:
+      app-version:
+        description: 'Image version this chart should default to. Falls back to the newest autoscaler-v* tag.'
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Override the bump. `auto` derives it from the commit messages.'
+        required: false
+        default: auto
+        type: choice
+        options: [auto, patch, minor, major]
+
+concurrency:
+  group: external-node-autoscaler-chart-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RELEASE_PATHS: 'charts .github/workflows/chart.yml'
+  IMAGE: ghcr.io/${{ github.repository }}
+  CHART_REGISTRY: oci://ghcr.io/${{ github.repository }}/charts
+  HELM_VERSION: v3.16.4
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Lint
+        run: helm lint charts/ --set-string image.repository=example.invalid/x
+
+      - name: Render
+        run: |
+          set -eu
+          render() {
+            echo "--- helm template $*"
+            helm template ea charts/ --set-string image.repository=example.invalid/x "$@" >/dev/null
+          }
+          render
+          render --set rbac.create=false --set serviceAccount.create=false
+          render --set config.drain=true
+          render --set-string fullnameOverride=custom-name
+          echo "all renders clean"
+
+  publish:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    needs: lint
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Deduplicate against the image release
+        id: gate
+        if: github.event_name == 'push' && inputs.app-version == ''
+        run: |
+          set -eu
+          before='${{ github.event.before }}'
+          skip=false
+          if [ -n "$before" ] && [ "$before" != "0000000000000000000000000000000000000000" ] \
+             && git cat-file -e "$before^{commit}" 2>/dev/null; then
+            if git diff --name-only "$before" '${{ github.sha }}' \
+                 | grep -qE '^(src/|\.github/workflows/external-node-autoscaler\.yml$)'; then
+              skip=true
+              echo "the image workflow runs for this push — it will publish the chart"
+            fi
+          else
+            echo "no usable before-SHA; publishing rather than skipping"
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        if: steps.gate.outputs.skip != 'true'
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Resolve versions
+        id: version
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          APP_VERSION_INPUT: ${{ inputs.app-version }}
+        run: |
+          set -euo pipefail
+          # Scoped to charts/, so an operator-only `feat:` does not bump the
+          # chart's minor — and a chart-only one does not bump the operator's.
+          .github/scripts/next-version.sh chart '${{ inputs.bump }}' \
+            $RELEASE_PATHS | tee -a "$GITHUB_OUTPUT"
+
+          # The caller passes the image it just released. Standing alone, the
+          # newest released image is the right default; with no image released
+          # at all there is nothing installable to point at, so stop.
+          app="$APP_VERSION_INPUT"
+          [ -n "$app" ] || app=$(git tag -l 'autoscaler-v*' \
+            | sed -nE 's/^autoscaler-v([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' \
+            | sort -V | tail -n1)
+          if [ -z "$app" ]; then
+            echo "no autoscaler-v* release yet — nothing to point image.tag at." >&2
+            echo "Push a change under src/ first." >&2
+            exit 1
+          fi
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+          echo "chart will default image.tag to $app"
+
+      - name: Stamp and package
+        id: package
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          APP: ${{ steps.version.outputs.app }}
+        run: |
+          set -eu
+          rm -rf build && mkdir -p build
+          cp -R charts build/external-node-autoscaler
+          python3 - "build/external-node-autoscaler/values.yaml" <<'PY'
+          import os, re, sys
+
+          path = sys.argv[1]
+          image = os.environ["IMAGE"]
+          app = os.environ["APP"]
+          text = open(path).read()
+
+          note = (
+              "  # Stamped by CI when this chart was packaged: the operator image\n"
+              "  # built from the same release. Installing from a git checkout instead\n"
+              "  # leaves these empty and `make autoscaler` injects the GHCR URL.\n"
+          )
+          subs = [
+              (r'^  # Published by CI to .*\n  # so you normally do not edit this\.\n', note),
+              (r'^  repository: ""$', f"  repository: {image}"),
+              (r'^  tag: latest$', f'  tag: "{app}"'),
+          ]
+          for pattern, replacement in subs:
+              text, n = re.subn(pattern, replacement, text, count=1, flags=re.M)
+              if n != 1:
+                  sys.exit(f"values.yaml no longer matches {pattern!r} — refusing to "
+                           f"publish a chart whose image default was not stamped")
+          open(path, "w").write(text)
+          print("stamped image.repository and image.tag")
+          PY
+
+          helm package build/external-node-autoscaler \
+            --version "$VERSION" --app-version "$APP" --destination build
+
+          helm template ea "build/external-node-autoscaler-$VERSION.tgz" >/dev/null
+          echo "tgz=build/external-node-autoscaler-$VERSION.tgz" >> "$GITHUB_OUTPUT"
+
+      - name: Push to GHCR
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -eu
+          echo '${{ secrets.GITHUB_TOKEN }}' \
+            | helm registry login ghcr.io -u '${{ github.actor }}' --password-stdin
+          helm push '${{ steps.package.outputs.tgz }}' '${{ env.CHART_REGISTRY }}'
+
+      - name: Tag and release
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PREV: ${{ steps.version.outputs.previous }}
+          VERSION: ${{ steps.version.outputs.version }}
+          APP: ${{ steps.version.outputs.app }}
+        run: |
+          set -eu
+          git tag "$TAG" '${{ github.sha }}'
+          git push origin "$TAG"
+
+          [ "$PREV" = none ] && range="" || range="chart-v$PREV..HEAD"
+          {
+            echo "Chart \`$VERSION\`, defaulting to operator image \`$APP\`."
+            echo
+            echo '```'
+            echo "helm install external-node-autoscaler \\"
+            echo "  ${CHART_REGISTRY}/external-node-autoscaler --version ${VERSION}"
+            echo '```'
+            echo
+            echo "### Changes"
+            echo
+            git log --no-merges --pretty='- %s (%h)' $range -- $RELEASE_PATHS || true
+          } > chart-notes.md
+          # Type FIRST. GitHub's release sidebar truncates from the right, so
+          # titles that both start with the repo name collapse to an identical
+          # "external-node-auto..." and the chart and the image become
+          # indistinguishable in the list.
+          gh release create "$TAG" --title "chart v$VERSION - external-node-autoscaler" \
+            --notes-file chart-notes.md

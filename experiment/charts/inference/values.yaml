@@ -1,0 +1,284 @@
+namespace:
+  name: inference
+  # Leave false when installing with Helm: `--create-namespace` makes Helm own
+  # the release namespace, and a chart-declared Namespace with the same name
+  # then fails the ownership check. Flip to true for `helm template | kubectl
+  # apply` / GitOps flows, where nobody else creates it.
+  create: false
+
+# Liqo NamespaceOffloading. Verified against the Liqo v1.0.1 CRDs:
+# offloading.liqo.io/v1beta1, kind NamespaceOffloading, namespaced.
+offloading:
+  enabled: true
+  # Liqo only reconciles the NamespaceOffloading named `offloading` — this is
+  # the name `liqoctl offload namespace` uses. Do not rename it.
+  name: offloading
+  # Remote: nothing in this namespace may run on hub nodes. That is what turns
+  # an unschedulable pod into an honest demand signal for the autoscaler.
+  podOffloadingStrategy: Remote
+  # EnforceSameName: the twin namespace on K3s is also called `inference`, so
+  # k3s-side/11-vllm-public-nodeport.yaml can target it by name.
+  namespaceMappingStrategy: EnforceSameName
+
+  # Which peered clusters this namespace is offloaded to.
+  #
+  # An EMPTY list means all of them, and it is emitted present-but-empty rather
+  # than omitted — exactly what `liqoctl offload namespace` with no --selector
+  # produces. MatchVirtualNodeSelectorTerms short-circuits to true only when the
+  # terms list is len 0, and an offloading that selects nothing fails unhelpfully:
+  # pods schedule onto the virtual node and are rejected with PodOffloadingBackOff.
+  clusterSelector:
+    nodeSelectorTerms: []
+
+vllm:
+  enabled: true
+
+  image:
+    repository: vllm/vllm-openai
+    tag: v0.25.1
+    pullPolicy: IfNotPresent
+
+  replicas: 1
+
+  model: mistralai/Mistral-7B-Instruct-v0.3
+  extraArgs:
+    - --max-model-len=8192
+    - --gpu-memory-utilization=0.92
+
+  port: 8000
+
+  serviceName: vllm-svc
+
+  service:
+    type: ClusterIP
+    annotations: {}
+    # Only used when type is NodePort or LoadBalancer. Empty lets Kubernetes
+    # allocate from the 30000-32767 range.
+    nodePort: ""
+
+  modelCache:
+    enabled: true
+    hostPath: /opt/models
+
+  # Optional. Create it yourself; the chart never renders it:
+  #   kubectl -n inference create secret generic hf-token --from-literal=HF_TOKEN=...
+  hfToken:
+    enabled: false
+    secretName: hf-token
+    secretKey: HF_TOKEN
+
+  resources:
+    requests:
+      cpu: "6"
+      memory: 20Gi
+      nvidia.com/gpu: 1
+    limits:
+      memory: 36Gi
+      nvidia.com/gpu: 1
+
+  # Loading a 7B model from a cold cache takes minutes. 180 × 5s = 15 minutes
+  # before the kubelet gives up.
+  startupProbe:
+    failureThreshold: 180
+    periodSeconds: 5
+
+  readinessProbe:
+    periodSeconds: 10
+    failureThreshold: 3
+
+  # Pin the pod to Liqo virtual nodes explicitly rather than trusting the
+  # NamespaceOffloading to do it.
+  #
+  # Liqo's pod-mutating webhook is gated on the namespace carrying
+  # `liqo.io/scheduling-enabled: "true"`, which the NamespaceOffloading controller
+  # stamps only after offloading reconciles against a live peering. Until then no
+  # affinity and no virtual-node toleration is injected. The missing toleration is
+  # the one that bites: the pod cannot be placed on a virtual node at all, and
+  # pends forever for a reason that looks nothing like the cause.
+  #
+  # Set false only if you want Liqo to be the sole authority on placement.
+  forceRemoteScheduling: true
+
+  podAnnotations: {}
+  podLabels: {}
+
+  # WHICH POOL this wants. Must match the labels and taints the autoscaler
+  # stamps on that pool's virtual nodes — a selector naming a pool that does not
+  # exist matches nothing and rents NOTHING rather than guessing.
+  nodeSelector:
+    byon/pool: gpu
+
+  # One per taint on the pool above. The virtual-node toleration is separate —
+  # see forceRemoteScheduling.
+  poolTolerations:
+    - key: byon/pool
+      operator: Equal
+      value: gpu
+      effect: NoSchedule
+
+# CPU-ONLY STAND-IN WORKLOAD. Off by default; `make test-cpu` turns it on (and
+# vLLM off). Same demand loop as vLLM minus the accelerator, so the whole path
+# can be exercised against a 2 vCPU box that joins in about two minutes.
+#
+# A separate Deployment rather than vLLM with the GPU request stripped, because
+# vLLM cannot run on it — see templates/cpu-deployment.yaml.
+cpu:
+  enabled: false
+
+  # Names the Deployment, the pod label and the Service selector.
+  name: cpu-demand
+  serviceName: cpu-demand-svc
+
+  # ONE MACHINE PER REPLICA (see the sizing note below), and every peered machine
+  # costs the HUB two pod slots: a `gw-<machine>` gateway and a `vk-<machine>`
+  # virtual kubelet. That ceiling is on the hub, not the pool, which is why it
+  # surprises. With the shipped 3 x t3.small (11 pods each):
+  #
+  #   33 slots - 23 for kube-system/liqo/the operator = 10 free = 5 peerings
+  #
+  # Past that, machines are rented, boot, and cannot peer: the gateway pod stays
+  # Pending, the operator reads the scheduler's verdict off it and abandons the
+  # handshake, and the machine bills until the boot timeout reaps it. A cost you
+  # notice rather than a hang. Check headroom before raising this:
+  #
+  #   kubectl get nodes -l '!liqo.io/type' \
+  #     -o custom-columns=N:.metadata.name,MAXPODS:.status.allocatable.pods
+  #   kubectl get pods -A --no-headers | grep -vc '^liqo-tenant-'
+  replicas: 1
+
+  image:
+    # nginx rather than a sleep container: it answers HTTP, so the pod is
+    # reachable through the tunnel and the test can prove more than "scheduled".
+    # Same unprivileged image the gateway already pins, so a CPU test pulls
+    # nothing new.
+    repository: nginxinc/nginx-unprivileged
+    tag: 1.29-alpine
+    pullPolicy: IfNotPresent
+
+  # The unprivileged image cannot bind 80.
+  port: 8080
+
+  service:
+    enabled: true
+
+  # A sidecar that prints a timestamp on a loop, so `kubectl logs -f` is enough to
+  # see the pod is alive.
+  #
+  # It proves the other half of the peering: the Service proves the data path, the
+  # log stream proves the control-plane path, because `kubectl logs` on an
+  # offloaded pod is served by Liqo's virtual kubelet proxying to the remote K3s
+  # API. That half can break on its own, and a Running pod then tells you nothing.
+  heartbeat:
+    enabled: true
+    intervalSeconds: 5
+    # Tiny on purpose — this must not change which machines the pod fits on.
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+      limits:
+        memory: 32Mi
+
+  # SIZED AGAINST THE POOL, and not optional. A request no rented machine can
+  # satisfy never becomes a Running pod: the autoscaler rents, the pod still does
+  # not fit, and the pool churns to maxMachines while nothing schedules.
+  #
+  # The budget is NOT the machine's spec sheet. A virtual node advertises the
+  # flavor's capacity MINUS the pool's system+daemonset reserve. The operator logs
+  # the real figure every pass:
+  #
+  #   pool cpu-dryrun: ... flavors=[d2-4=Resources(cpu=1200m, memory=2150Mi, ...)]
+  #
+  # — a 2 vCPU / 4 GB d2-4 whose 800m/1664Mi reserve leaves 1200m and 2150Mi.
+  #
+  # So the request below is just under one machine's worth, and that
+  # one-pod-per-machine ratio is the useful part: raise `replicas` and you rent
+  # that many machines, exercising the pool's OVH-then-Vultr fall-through.
+  #
+  # The scheduler uses the POD total, so it includes the heartbeat sidecar above:
+  # 1000m + 10m against 1200m advertised. A bigger reserve or a smaller flavor
+  # shrinks the budget without touching anything here — check the log line.
+  resources:
+    requests:
+      cpu: "1"
+      memory: 1Gi
+    limits:
+      memory: 1Gi
+
+  # See vllm.forceRemoteScheduling. Doubly load-bearing here: this pod asks for
+  # nothing a hub node could not give it, so without the injected
+  # `liqo.io/type: virtual-node` selector it would simply land on EKS and
+  # generate no demand at all.
+  forceRemoteScheduling: true
+
+  podAnnotations: {}
+  podLabels: {}
+
+  # WHICH POOL. Must match a declared pool's nodeLabels — a selector naming a
+  # pool that does not exist rents NOTHING rather than guessing.
+  nodeSelector:
+    byon/pool: cpu-dryrun
+
+  # One per taint on the pool above.
+  poolTolerations:
+    - key: byon/pool
+      operator: Equal
+      value: cpu-dryrun
+      effect: NoSchedule
+
+gateway:
+  enabled: true
+
+  # Must NOT be the offloaded namespace. Anything created there is forced onto a
+  # virtual node.
+  namespace: inference-gw
+
+  replicas: 2
+
+  image:
+    repository: nginxinc/nginx-unprivileged
+    # Unprivileged variant: it listens on a high port as a non-root user, so the
+    # container needs no NET_BIND_SERVICE and runs with a read-only root
+    # filesystem.
+    tag: 1.29-alpine
+    pullPolicy: IfNotPresent
+
+  # High port, because the unprivileged image cannot bind 80.
+  containerPort: 8080
+
+  # Cluster DNS, for run-time resolution of the backend Service. `kube-dns` is
+  # the Service name even when CoreDNS is what answers.
+  resolver: kube-dns.kube-system.svc.cluster.local
+
+  # Generation can take minutes and nginx's default proxy_read_timeout is 60s,
+  # which would sever a long completion mid-stream.
+  proxyTimeout: 3600s
+
+  # Long prompts exceed nginx's 1m default, which would surface as a 413 that
+  # looks like a model error.
+  maxBodySize: 32m
+
+  ingress:
+    className: alb
+    # Empty means the ALB answers on its own DNS name for every host.
+    host: ""
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internet-facing
+      # ip, not instance: the whole point of the gateway. Targets are the proxy
+      # pods' VPC addresses.
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+      # Health-checks the PROXY, not the model — see templates/gateway.yaml. A
+      # check that followed vLLM would deregister the gateway whenever the GPU
+      # machine is away, replacing nginx's informative 502 with the ALB's opaque
+      # 503.
+      alb.ingress.kubernetes.io/healthcheck-path: /healthz
+      alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+      alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi

@@ -1,0 +1,78 @@
+Namespace {{ .Values.namespace.name }} is offloaded
+  strategy: {{ .Values.offloading.podOffloadingStrategy }} / {{ .Values.offloading.namespaceMappingStrategy }}
+
+Check that Liqo accepted the offloading (it needs at least one virtual node):
+  kubectl -n {{ .Values.namespace.name }} get namespaceoffloading {{ .Values.offloading.name }} -o yaml
+
+{{- if .Values.vllm.enabled }}
+
+vLLM {{ .Values.vllm.image.tag }} serving {{ .Values.vllm.model }} on {{ .Values.vllm.serviceName }}:{{ .Values.vllm.port }}.
+  pool: {{ range $k, $v := .Values.vllm.nodeSelector }}{{ $k }}={{ $v }} {{ end }}
+
+Until a virtual node with a free GPU exists, the pod stays Pending
+Unschedulable — that is intentional, it is the autoscaler's demand signal:
+  kubectl -n {{ .Values.namespace.name }} get pods -w
+
+Expose it publicly from the OVH side (manual, K3s kubeconfig):
+  kubectl --kubeconfig k3s.yaml apply -f k3s-side/11-vllm-public-nodeport.yaml
+
+{{ if .Values.gateway.enabled -}}
+GATEWAY ENABLED — public path through EKS, no NodePort anywhere:
+  internet -> ALB (ip targets) -> gateway pod -> {{ .Values.vllm.serviceName }} -> Liqo -> OVH pod
+
+  kubectl -n {{ .Values.gateway.namespace }} get ingress vllm-gateway -w
+
+An empty ADDRESS with no events means aws-load-balancer-controller is missing:
+  make alb-controller
+
+Once ADDRESS appears:
+  ADDR=$(kubectl -n {{ .Values.gateway.namespace }} get ingress vllm-gateway \
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+  curl http://$ADDR/healthz     # the gateway itself; 200 as soon as targets register
+  curl http://$ADDR/v1/models   # the model, through Liqo
+
+Reading the two apart is the point of /healthz:
+  200 on /healthz, 502 on /v1/models -> AWS side fine, no GPU machine or vLLM
+                                        still loading
+  503 on /healthz                    -> no healthy targets: the ALB cannot reach
+                                        the gateway pods. Check the controller
+                                        log, not the model.
+{{- else }}
+Reach it through EKS with no AWS resources at all:
+  kubectl -n {{ .Values.namespace.name }} port-forward svc/{{ .Values.vllm.serviceName }} {{ .Values.vllm.port }}:{{ .Values.vllm.port }}
+For a public address, set gateway.enabled=true (ALB, needs
+`make alb-controller`) or vllm.service.type=LoadBalancer (NLB, nothing extra to
+install).
+{{- end }}
+{{- end }}
+{{- if .Values.cpu.enabled }}
+
+CPU-ONLY workload {{ .Values.cpu.name }} ({{ .Values.cpu.replicas }} replica(s), {{ .Values.cpu.resources.requests.cpu }} CPU each).
+  pool: {{ range $k, $v := .Values.cpu.nodeSelector }}{{ $k }}={{ $v }} {{ end }}
+
+Same demand signal as vLLM, on a machine that joins in ~2 minutes:
+  kubectl -n {{ .Values.namespace.name }} get pods -l app={{ .Values.cpu.name }} -w
+  kubectl get nodes -l liqo.io/type=virtual-node -L external-node-autoscaler/pool
+
+{{- if .Values.cpu.heartbeat.enabled }}
+
+Heartbeat — one line every {{ .Values.cpu.heartbeat.intervalSeconds }}s, naming the machine that ran it:
+  kubectl -n {{ .Values.namespace.name }} logs -f deploy/{{ .Values.cpu.name }} -c heartbeat
+
+That stream is served by Liqo's virtual kubelet proxying to the remote K3s API,
+so a ticking clock proves the CONTROL-PLANE path back from the rented machine —
+which can be broken while the pod still reads Running.
+{{- end }}
+
+Running proves the scheduler was satisfied. To prove the DATA path carries traffic:
+{{- if .Values.cpu.service.enabled }}
+  kubectl -n {{ .Values.namespace.name }} port-forward svc/{{ .Values.cpu.serviceName }} {{ .Values.cpu.port }}:{{ .Values.cpu.port }}
+  curl -s -o /dev/null -w '%{http_code}\n' localhost:{{ .Values.cpu.port }}   # 200
+{{- else }}
+  set cpu.service.enabled=true and port-forward to it.
+{{- end }}
+
+A pod that stays Pending after a machine joins is a sizing mismatch, not a
+peering failure — compare its request against the node:
+  kubectl describe node -l external-node-autoscaler/pool | grep -A5 Allocatable
+{{- end }}

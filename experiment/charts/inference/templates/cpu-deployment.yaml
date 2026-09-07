@@ -1,0 +1,156 @@
+{{- if .Values.cpu.enabled }}
+{{/*
+  A CPU-only stand-in workload, whose entire job is to be demand for a CPU pool.
+
+  Deliberately NOT the vLLM Deployment with the GPU request removed. That would
+  schedule and then crash-loop: `vllm/vllm-openai` is a CUDA image, and this
+  chart's vLLM template also pins `liqo.io/remote-runtime-class-name: nvidia`,
+  mounts the model-cache hostPath and probes /health. None of that survives the
+  move to a CPU box, so the two workloads are separate templates that share only
+  their placement idiom (see deployment.yaml — the nodeSelector/toleration
+  block below is intentionally identical).
+
+  What it buys: a CPU pool is the cheap, fast way to exercise the whole loop —
+  Pending pod -> rent -> K3s + Liqo join -> peer -> pod Running -> idle -> reap
+  — without an accelerator on the bill. The `cpu-dryrun` pool in
+  values.local.yaml.example skips the NVIDIA stack entirely and joins in about
+  two minutes, against many for a GPU box.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.cpu.name }}
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    app: {{ .Values.cpu.name }}
+spec:
+  replicas: {{ .Values.cpu.replicas }}
+  # Recreate, not the RollingUpdate default: with one pod per rented machine
+  # (see values.yaml on sizing), a surge would rent an EXTRA machine just to
+  # roll a change through, and then reap it minutes later.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: {{ .Values.cpu.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.cpu.name }}
+        {{- with .Values.cpu.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.cpu.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- $ns := .Values.cpu.nodeSelector | default dict }}
+      {{- if .Values.cpu.forceRemoteScheduling }}
+      {{- $ns = merge (dict "liqo.io/type" "virtual-node") $ns }}
+      {{- end }}
+      {{- with $ns }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if or .Values.cpu.forceRemoteScheduling .Values.cpu.poolTolerations }}
+      tolerations:
+        {{- if .Values.cpu.forceRemoteScheduling }}
+        # Same reasoning as vLLM's, and it matters MORE here: this pod asks for
+        # nothing a hub node could not satisfy, so the nodeSelector above is the
+        # only thing keeping it off EKS, and the toleration is the only thing
+        # letting it onto a virtual node before Liqo's webhook starts firing.
+        - key: virtual-node.liqo.io/not-allowed
+          operator: Exists
+          effect: NoExecute
+        {{- end }}
+        {{- with .Values.cpu.poolTolerations }}
+        # One per taint on the selected pool.
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: {{ .Values.cpu.name }}
+          image: "{{ .Values.cpu.image.repository }}:{{ .Values.cpu.image.tag }}"
+          imagePullPolicy: {{ .Values.cpu.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.cpu.port }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.cpu.resources | nindent 12 }}
+        {{- if .Values.cpu.heartbeat.enabled }}
+        {{/*
+          A sidecar whose only output is a timestamp, so `kubectl logs -f` shows
+          the pod is alive without exec'ing into anything.
+
+          Worth more than liveness here: for an offloaded pod, `kubectl logs`
+          against the hub is served by Liqo's virtual kubelet, which proxies the
+          request to the remote K3s API. A ticking heartbeat therefore proves
+          the CONTROL-PLANE path back from the rented machine works — a
+          different thing from the data path the Service proves, and the one
+          that silently does not work when peering is half-established.
+
+          It reuses cpu.image rather than pulling a busybox: the nginx image is
+          alpine, so `sh`, `date` and `sleep` are already in it and a CPU test
+          still pulls exactly one image.
+        */}}
+        - name: heartbeat
+          image: "{{ .Values.cpu.image.repository }}:{{ .Values.cpu.image.tag }}"
+          imagePullPolicy: {{ .Values.cpu.image.pullPolicy }}
+          env:
+            # Which machine actually ran it. Resolved by the kubelet that starts
+            # the container, which for an offloaded pod is the rented box's own
+            # K3s kubelet — so this names the remote node, not the virtual one.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          command: ["/bin/sh", "-c"]
+          # `while :` and unbuffered echo: no log driver buffering to wait out,
+          # so the first line lands the moment the container starts.
+          args:
+            - |
+              echo "heartbeat: every {{ .Values.cpu.heartbeat.intervalSeconds }}s from $POD_NAME"
+              while :; do
+                echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') alive  pod=$POD_NAME node=$NODE_NAME"
+                sleep {{ .Values.cpu.heartbeat.intervalSeconds }}
+              done
+          resources:
+            {{- toYaml .Values.cpu.heartbeat.resources | nindent 12 }}
+        {{- end }}
+{{- if .Values.cpu.service.enabled }}
+---
+{{/*
+  Not needed to make the pod demand a machine — but "pod is Running" only proves
+  the scheduler was satisfied. Curling this through a port-forward proves the
+  Liqo tunnel actually carries traffic to the rented box, which is the half of
+  the loop a Pending-then-Running watch cannot see.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.cpu.serviceName }}
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    app: {{ .Values.cpu.name }}
+spec:
+  type: ClusterIP
+  selector:
+    app: {{ .Values.cpu.name }}
+  ports:
+    - name: http
+      port: {{ .Values.cpu.port }}
+      targetPort: {{ .Values.cpu.port }}
+      protocol: TCP
+{{- end }}
+{{- end }}

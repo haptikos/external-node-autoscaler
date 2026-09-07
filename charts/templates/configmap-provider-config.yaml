@@ -1,0 +1,64 @@
+{{/*
+The fleet: where machines can be rented, and which pool rents them.
+
+A provider's `config` and a pool's provider entry are passed through VERBATIM —
+those are provider vocabulary, and the moment a template reads one, adding a node
+source becomes a chart change. Pool structure is core vocabulary and is rendered
+explicitly.
+
+The trade is that Helm cannot catch a missing required key; the operator does, at
+startup, naming it — so a fresh install that CrashLoopBackOffs is a config error
+to read in the logs.
+*/}}
+{{- if not .Values.providers }}
+{{- fail "external-node-autoscaler: providers is required — at least one entry with a name and a credentialsSecret" }}
+{{- end }}
+{{- if not .Values.pools }}
+{{- fail "external-node-autoscaler: pools is required — with no pools nothing can ever be rented" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "external-node-autoscaler.fullname" . }}-provider
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "external-node-autoscaler.labels" . | nindent 4 }}
+data:
+  fleet.yaml: |
+    providers:
+      {{- range .Values.providers }}
+      - name: {{ required "each entry in providers needs a name (a directory under autoscaler/providers/)" .name }}
+        {{- with .batchSize }}
+        batchSize: {{ . }}
+        {{- end }}
+        config:
+          {{- toYaml (.config | default dict) | nindent 10 }}
+      {{- end }}
+    pools:
+      {{- range .Values.pools }}
+      - name: {{ required "each entry in pools needs a name" .name }}
+        {{- with .minMachines }}
+        minMachines: {{ . }}
+        {{- end }}
+        {{- with .maxMachines }}
+        maxMachines: {{ . }}
+        {{- end }}
+        {{- with .systemReserve }}
+        systemReserve:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .daemonsetReserve }}
+        daemonsetReserve:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .nodeLabels }}
+        nodeLabels:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .taints }}
+        taints:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        providers:
+          {{- toYaml (required (printf "pool %s needs at least one provider" .name) .providers) | nindent 10 }}
+      {{- end }}

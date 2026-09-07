@@ -1,0 +1,41 @@
+external-node-autoscaler installed as {{ include "external-node-autoscaler.fullname" . }} in {{ .Release.Namespace }}.
+
+Topology: one single-node K3s cluster per rented machine, peered individually.
+           1 machine = 1 cluster = 1 node = 1 virtual node.
+
+Fleet max: {{ if eq (int .Values.config.maxMachines) 0 }}unlimited{{ else }}{{ .Values.config.maxMachines }}{{ end }} machines across all pools{{ if .Values.config.drain }}   DRAIN IS ON — renting nothing{{ end }}
+Liqo: {{ .Values.config.liqoVersion }} (must match the hub chart AND each machine)
+
+Providers:
+{{- range .Values.providers }}
+  {{ .name }}   credentials: {{ .credentialsSecret }}
+{{- end }}
+
+Pools (first match wins for a pod that fits more than one):
+{{- range .Values.pools }}
+  {{ .name }}   {{ .minMachines | default 0 }}..{{ if eq (int (.maxMachines | default 0)) 0 }}unlimited{{ else }}{{ .maxMachines }}{{ end }} machines
+    select with: {{ if .nodeLabels }}{{ range $k, $v := .nodeLabels }}{{ $k }}={{ $v }} {{ end }}{{ else }}(no labels — matches any pod that asks for nothing specific){{ end }}
+{{- end }}
+
+It will CrashLoopBackOff until every provider's credentials secret exists in
+{{ .Release.Namespace }}. Each key in those secrets becomes an env var.
+
+Provider settings are passed through untouched, so this chart cannot tell you a
+required one is missing — the operator does, at startup, naming the key. If the
+pod restarts immediately after this install, read its log first:
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "external-node-autoscaler.fullname" . }}
+
+Keys and defaults for each provider live with the code that reads them:
+{{- range .Values.providers }}
+  src/autoscaler/providers/{{ .name }}/
+{{- end }}
+
+Nothing rented ever calls this cluster: the operator generates each machine's
+certificate authorities before ordering it and assembles the kubeconfig itself.
+There is no join token and no k3s-kubeconfig secret.
+
+Watch it reconcile:
+  kubectl -n {{ .Release.Namespace }} logs -f deploy/{{ include "external-node-autoscaler.fullname" . }}
+  kubectl get nodes -l liqo.io/type=virtual-node -L external-node-autoscaler/pool
+  kubectl get foreignclusters
+  kubectl -n {{ .Release.Namespace }} get secrets -l managed-by=external-node-autoscaler

@@ -1,0 +1,310 @@
+# external-node-autoscaler
+#
+# Each rented machine is its own single-node K3s cluster, peered with the hub in
+# its own right. There is no shared K3s to join, so there is no join URL and no
+# join token here.
+#
+# The release is named for GPUs but the operator is not GPU-specific: it scales
+# on whatever pending pods actually request — cpu, memory, GPUs, pod count — so
+# a CPU-only pool needs no special mode. Where machines come from is
+# `providers:` below.
+#
+
+image:
+  # Published by CI to ghcr.io/<owner>/<repo>; `make autoscaler` injects it,
+  # so you normally do not edit this.
+  repository: ""
+  tag: latest
+
+  pullPolicy: Always
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# --- where machines can be rented ---------------------------------------------
+# The chart knows only three things about a provider: its name, which secret
+# holds its credentials, and that `config` is passed through verbatim. It never
+# reads a key inside `config`, so adding a node source is a values change and
+# NOT a chart change — no template here mentions any provider by name.
+#
+# The keys that belong under `config` and their defaults live with the code that
+# reads them: src/autoscaler/providers/<name>/config.py,
+# with an example block in that directory's values.example.yaml.
+#
+# The cost of that passthrough: Helm cannot tell you a required key is missing.
+# The operator does, at startup, naming the key — look at the pod logs if it
+# CrashLoopBackOffs right after an install.
+#
+# ONE ENTRY PER PROVIDER TYPE: credentials arrive as environment variables, so
+# two OVH entries would silently share one account.
+#
+# `providers` and `pools` are LISTS, and Helm REPLACES a list wholesale — so
+# `--set providers[0].config.project=x` alone drops the `name` this file
+# supplies, and an override file defining `pools` must spell out ALL of them.
+providers:
+  # `name` must match a directory under autoscaler/providers/ that contains a
+  # provider.py. The operator logs the available names if this one is unknown.
+  - name: ovh
+
+    # Every key in this secret becomes an environment variable (envFrom), which
+    # is how a provider's client library finds its credentials without the
+    # chart knowing their names. For OVH: OVH_ENDPOINT, OVH_APPLICATION_KEY,
+    # OVH_APPLICATION_SECRET, OVH_CONSUMER_KEY.
+    credentialsSecret: ovh-creds
+
+    # Machines to create here per reconcile pass, SHARED by every pool that
+    # rents here. A larger deficit spreads over consecutive passes. Do not raise
+    # it much: each create is a blocking API call, and this is also the blast
+    # radius of a bad provision script.
+    batchSize: 50
+
+    # Opaque: the account, not what to rent. See providers/ovh/values.example.yaml.
+    config: {}
+
+  # A SECOND PROVIDER is another entry here, plus an entry in each pool that
+  # should use it. Nothing else changes — no template below reads either one.
+  # - name: vultr
+  #   credentialsSecret: vultr-creds        # VULTR_API_KEY
+  #   batchSize: 50
+  #   config: {}                            # providers/vultr/values.example.yaml
+
+# --- pools: the machine types workloads can ask for ---------------------------
+# `nodeLabels` and `taints` are stamped on the virtual node each machine becomes,
+# so a pod selects a pool with an ordinary nodeSelector.
+#
+# ORDER IS THE TIEBREAK, NOT THE RULE: a pod goes to the first pool whose labels
+# satisfy its selectors AND whose taints it tolerates. Matching NO pool is
+# reported unroutable and rents nothing. Taints are what stop an unselective pod
+# landing on an expensive pool.
+pools:
+  # Named for what a pod ASKS for, not for the card it happens to get: one pool
+  # can hold several GPU types across several providers, and the inference
+  # chart's default nodeSelector is this name.
+  - name: gpu
+
+    # What a pod's nodeSelector matches.
+    nodeLabels:
+      byon/pool: gpu
+
+    # A pod must tolerate every one of these — how a pool-agnostic pod is kept
+    # off a GPU.
+    taints:
+      - key: byon/pool
+        value: gpu
+        effect: NoSchedule
+
+    # minMachines is PROACTIVE: the pool rents to reach it even with no demand.
+    # maxMachines 0 means NO LIMIT; config.maxMachines is a fleet-wide ceiling
+    # on top, and the tighter of the two wins.
+    minMachines: 0
+    maxMachines: 0
+
+    # Tried in ascending `priority`. No stock falls through to the next in the
+    # same pass; anything else stops the pool for that pass. Every key other than
+    # `name` and `priority` is provider vocabulary, validated by that provider.
+    #
+    # Two providers in one pool is how a pool survives one of them running dry:
+    #   - name: ovh
+    #     priority: 10
+    #     flavors: [a10-45]
+    #   - name: vultr
+    #     priority: 20
+    #     flavors: [vcg-l40s-16c-128g-48vram]
+    providers:
+      - name: ovh
+        priority: 10
+        flavors:
+          - a10-45
+          - rtx5000-28
+        gpu: true
+
+  # Declared permanently alongside the GPU pool. An idle pool rents nothing, so
+  # there is no mode to switch and no values file to swap — a test target just
+  # applies a workload that asks for this pool.
+  - name: cpu-dryrun
+    nodeLabels:
+      byon/pool: cpu-dryrun
+    # Without this a pod that forgot its selector would land here and the
+    # dry-run would stop proving anything.
+    taints:
+      - key: byon/pool
+        value: cpu-dryrun
+        effect: NoSchedule
+    minMachines: 0
+    maxMachines: 0
+    # Held back on every machine in this pool, so it is never offered to the
+    # scheduler. Sized for a d2-4: the defaults (1 CPU / 2Gi + 200m / 256Mi)
+    # would leave almost nothing on a 4GB box. What is left after these is the
+    # tight part — if peering starts half-completing here, suspect memory
+    # before anything else.
+    systemReserve:
+      cpu: 700m
+      memory: 1536Mi
+    daemonsetReserve:
+      cpu: 100m
+      memory: 128Mi
+    providers:
+      - name: ovh
+        priority: 10
+        flavors:
+          - d2-4
+          - d2-8
+        # Skips the NVIDIA stack. Same provision.sh either way — the flag
+        # reaches it through the env file it sources.
+        gpu: false
+
+# --- operator configuration (all become env vars) -----------------------------
+config:
+  # Reconcile cadence.
+  intervalSeconds: 30
+
+  # DEBUG turns on per-request Kubernetes client logging — useful when chasing
+  # an API problem, deafening otherwise.
+  logLevel: INFO
+
+  # Namespaces scanned for Unschedulable pending pods. Comma-separated.
+  watchNamespaces: inference
+
+  # Cluster id this hub installed Liqo with. Must match liqo/values-eks.yaml.
+  consumerClusterId: hub
+
+  # Liqo version. Pinned in THREE places that must agree: the hub chart, the
+  # liqoctl baked into this image, and the liqoctl each machine installs.
+  # Peering across a version skew fails late and confusingly.
+  liqoVersion: v1.2.0
+  liqoNamespace: liqo
+  peerTimeout: 10m
+
+  # --- when a peering cannot be scheduled ---
+  # Every peering plants a gw-<machine> gateway pod ON THE HUB, and
+  # `liqoctl peer` blocks until it is ready. If the hub cannot schedule it the
+  # handshake fails with a networking error, so the cause looks like the rented
+  # machine when it is really the hub's scheduler.
+
+  # How long a peering pod may sit Pending with NO scheduling verdict before it
+  # is logged. Reported only, never acted on — patience for the ambiguous case
+  # (image pulling, webhook answering) where elapsed time is the only evidence.
+  # A pod the scheduler has REFUSED is acted on at once and never waits this
+  # long. Keep under peerTimeout so it is said while the handshake still runs.
+  stuckPodSeconds: 300
+
+  # Abandon a handshake once the scheduler has refused its gateway pod, instead
+  # of waiting out peerTimeout for an answer that cannot change. liqoctl exits
+  # non-zero either way and tears nothing down, so only the waiting is given up
+  # — and peering is serial, so that wait also delays every later step,
+  # scale-down included.
+  #
+  # Accepted race: refused pods are re-queued with up to ~10s of backoff, so the
+  # verdict can be that stale. A handshake abandoned inside that window costs one
+  # blockedRetrySeconds and then succeeds.
+  abortBlockedPeering: true
+
+  # CEILING on how long a refused machine is left alone — not the mechanism.
+  # The operator retries as soon as the scheduler stops refusing the gateway
+  # pod, which outlives the abandoned handshake and is the real signal; this
+  # timer only covers the case where that pod cannot be read at all.
+  #
+  # Shorter than bootSeconds on purpose: a machine the hub never makes room for
+  # gets a couple of retries and is then reaped rather than retried forever.
+  blockedRetrySeconds: 600
+
+  # --- how machines are trusted ---
+  # Nothing to configure, and that is the point: the operator generates each
+  # machine's certificate authorities before ordering it (autoscaler/pki.py) and
+  # builds its kubeconfig itself. Nothing rented holds a credential for the hub
+  # or needs an address for it, so hubApiEndpoint, hubCaBase64 and
+  # bootstrapTtlSeconds are gone.
+
+  # How long to wait on a rented machine's API before calling it not-ready. A
+  # machine mid-boot DROPs rather than rejects, so an unanswered probe spends
+  # this whole budget — keep it well under intervalSeconds.
+  probeTimeoutSeconds: 5
+
+  # --- identity ---
+  # Not cosmetic. A machine's name becomes its k3s node name, its Liqo cluster
+  # id, its tenant namespace suffix and its virtual node name, and every reap
+  # path filters on this prefix — which is also what keeps the hand-managed A10
+  # cluster, matching no prefix, permanently out of reach.
+  #
+  # The selected provider is appended automatically, so machines come out as
+  # external-ovh-1a2b and you can see where a box came from. Only the prefix
+  # below is used for matching: if the operator recognised just the current
+  # provider's machines, switching provider would strand the previous one's —
+  # invisible to every reap path, and still billing.
+  namePrefix: "external-"
+
+  # SSH public keys authorised on every rented machine, for `ssh ubuntu@<ip>`
+  # when you need to read /var/log/cloud-init-output.log yourself.
+  #
+  # These are PUBLIC keys — safe in git by definition. They are also
+  # identifying, and a key hardcoded here locks the next operator out of a
+  # machine they are paying for, so the default is empty and real keys belong
+  # in values.local.yaml. `make machine-ips` prints the addresses.
+  sshPublicKeys: []
+
+  # Addresses the hub egresses from. Rented machines allow the k3s API (6443)
+  # and the WireGuard tunnel (30000:32767/udp) from these and from nothing else.
+  # Filled by the Makefile from `terraform output hub_egress_ips`, which is the
+  # NAT gateway's public IP when use_private_subnets is true.
+  #
+  # Empty means from anywhere, and that is correct for public-subnet mode: there
+  # the hub leaves from each node's own auto-assigned public IP, which changes
+  # whenever a node is replaced, so pinning it would sever the peering later for
+  # a reason no one would connect to a node rotation.
+  hubEgressIps: ""
+
+  # --- bounds and timers ---
+  # Fleet-wide; per-pool ceilings apply too and the tighter one wins.
+  #
+  # 0 means NO LIMIT, and is the default: the bill is then bounded by demand,
+  # which is what a pod actually asks for, rather than by a number somebody has
+  # to raise every time a workload grows. Set a real number to cap spend.
+  #
+  # NOT the way to stop renting — 0 is unlimited, not zero. Use config.drain.
+  #
+  # No fleet-wide minMachines: a ceiling composes across pools, a floor does not.
+  maxMachines: 0
+  idleSeconds: 600
+
+  # Rent nothing, release everything, overriding every pool's minMachines. A
+  # flag rather than maxMachines=0, which means unlimited.
+  drain: false
+
+  # MUST stay above the hub's 300s not-ready eviction. The replacement pod is
+  # created by eviction, not by this timer; this timer only removes the corpse.
+  # Lowering it below 300 makes the operator race the kube-controller-manager.
+  deadSeconds: 900
+
+  # Covers k3s server init, the NVIDIA stack and a Liqo install. Also the window
+  # in which credentials for a machine that never appears are held before being
+  # deleted as orphaned.
+  bootSeconds: 1200
+
+  # How long a machine must stay absent from the provider's inventory before an
+  # orphan teardown believes it. Absence is a single API answer, and acting on
+  # one answer once destroyed a healthy machine mid-workload. This is a
+  # confirmation, not a grace period — keep it well under deadSeconds.
+  missingConfirmSeconds: 90
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}

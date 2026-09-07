@@ -1,0 +1,6 @@
+.DS_Store
+.git/
+*.tmproj
+# The Dockerfile that used to sit in files/ moved to src/
+# with the operator source, so files/ now holds only the two join templates —
+# both of which the chart genuinely ships. Nothing left to exclude here.

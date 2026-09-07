@@ -1,0 +1,8 @@
+# Installed by the loop in the Dockerfile, not named in it — adding a provider
+# should never mean editing a core file. Pinned so a rebuild months from now
+# produces the same operator.
+#
+# No SDK: the Vultr API is REST with a bearer token, and `requests` is already
+# in the image as a dependency of `kubernetes`. Pinned here anyway so this
+# provider states what it needs rather than relying on another package's tree.
+requests==2.34.2

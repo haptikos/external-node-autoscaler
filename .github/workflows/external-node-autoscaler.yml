@@ -1,0 +1,182 @@
+# Test, build and release src.
+name: external-node-autoscaler
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - '.github/workflows/external-node-autoscaler.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - '.github/workflows/external-node-autoscaler.yml'
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Override the bump. `auto` derives it from the commit messages.'
+        required: false
+        default: auto
+        type: choice
+        options: [auto, patch, minor, major]
+
+concurrency:
+  group: external-node-autoscaler-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    working-directory: src
+
+env:
+  RELEASE_PATHS: 'src .github/workflows/external-node-autoscaler.yml'
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            src/requirements.txt
+            src/autoscaler/providers/*/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          set -eu
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          for f in autoscaler/providers/*/requirements.txt; do
+            [ -e "$f" ] || continue
+            echo "installing provider deps from $f"
+            pip install -r "$f"
+          done
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -t tests -v
+
+  build:
+    if: github.event_name == 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Build (no push)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: src
+          # amd64 only: the Dockerfile fetches liqoctl-linux-amd64 by name, so
+          # an arm64 build would produce an image whose liqoctl cannot run.
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    if: github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the tag and the release
+      packages: write   # push to GHCR
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # the version comes from the tag history
+
+      - name: Compute next version
+        id: version
+        working-directory: .
+        run: |
+          set -euo pipefail
+          .github/scripts/next-version.sh autoscaler '${{ inputs.bump }}' \
+            $RELEASE_PATHS | tee -a "$GITHUB_OUTPUT"
+
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: src
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Keeps the manifest a plain single-platform image instead of an index
+          # carrying an unknown/unknown attestation entry.
+          provenance: false
+
+      - name: Tag the commit
+        run: |
+          set -eu
+          git tag "${{ steps.version.outputs.tag }}" "${{ github.sha }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PREV: ${{ steps.version.outputs.previous }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -eu
+          if [ "$PREV" = none ]; then
+            range=""
+          else
+            range="autoscaler-v$PREV..HEAD"
+          fi
+          {
+            echo "### Image"
+            echo
+            echo '```'
+            echo "${IMAGE}:${VERSION}"
+            echo '```'
+            echo
+            echo "Deploy with:"
+            echo
+            echo '```'
+            echo "helm upgrade --install external-node-autoscaler charts/ \\"
+            echo "  --set-string image.repository=${IMAGE} \\"
+            echo "  --set-string image.tag=${VERSION}"
+            echo '```'
+            echo
+            echo "### Changes"
+            echo
+            # Scoped to the operator: this release says nothing about a chart or
+            # terraform change that rode the same push.
+            git log --no-merges --pretty='- %s (%h)' $range -- $RELEASE_PATHS || true
+          } > notes.md
+          gh release create "$TAG" --title "external-node-autoscaler $VERSION" --notes-file notes.md
+        working-directory: .
+
+  publish-chart:
+    needs: release
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/chart.yml
+    with:
+      app-version: ${{ needs.release.outputs.version }}

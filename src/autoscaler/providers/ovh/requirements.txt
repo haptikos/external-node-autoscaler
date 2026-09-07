@@ -1,0 +1,4 @@
+# Installed by the loop in the Dockerfile, not named in it — adding a provider
+# should never mean editing a core file. Pinned so a rebuild months from now
+# produces the same operator.
+ovh==1.2.0

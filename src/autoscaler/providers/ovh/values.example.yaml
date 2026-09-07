@@ -1,0 +1,66 @@
+# Goes in the external-node-autoscaler chart values, passed through verbatim — so
+# these keys are documented here, next to the code that reads them
+# (providers/ovh/config.py). The ACCOUNT is a `providers` entry; what to RENT is
+# per pool.
+#
+# NOTHING SECRET HERE. The four OVH API credentials are a pre-created Secret
+# named by `credentialsSecret`, injected with envFrom.
+
+providers:
+  - name: ovh
+    credentialsSecret: ovh-creds
+
+    # Instances to create per reconcile pass, SHARED by every pool renting from
+    # this account. Do not raise it much: each create is a blocking API call,
+    # and this is the blast radius of a bad provision script.
+    batchSize: 50
+
+    config:
+      # Required: the 32-char hex public cloud project id.
+      project: "REPLACE-ME"
+
+      # Default region. A pool may override it — OVH stocks flavors unevenly
+      # across regions, so a second pool is often just a second region.
+      region: GRA11
+
+      imageName: "Ubuntu 24.04"
+
+      # The provisioning script. Defaults to provision.sh next to the provider
+      # code, which is what ships in the image; an absolute path is honoured as
+      # given, so a mounted ConfigMap can override it for hot-patching.
+      # provisionScript: /config/provision.sh
+
+pools:
+  - name: gpu-a10
+    nodeLabels:
+      byon/pool: gpu-a10
+    taints:
+      - key: byon/pool
+        value: gpu-a10
+        effect: NoSchedule
+    providers:
+      - name: ovh
+
+        # Ascending: the lowest priority entry is tried first, and a provider
+        # with no stock falls through to the next in the same pass. With one
+        # entry it does nothing except document intent.
+        priority: 10
+
+        # Priority order, first flavor with stock wins. NOT validated against
+        # the pool's name — a pool called gpu-a10 listing d2-8 as a fallback is
+        # your call, and naming pools is your job.
+        flavors:
+          - a10-45
+          - rtx5000-28
+
+        # Whether the rented flavor has a GPU. False skips the NVIDIA driver,
+        # the container toolkit, the device plugin and the wait for an
+        # allocatable GPU — which is what the cpu-dryrun pool sets.
+        gpu: true
+
+        # Machine size is NOT declared here. cpu and memory come from OVH's
+        # flavor API, GPU count from _GPU_PER_FLAVOR in provider.py, and both
+        # are corrected by the real machine once one peers.
+
+        # Optional: rent this pool somewhere other than the account region.
+        # region: SBG5

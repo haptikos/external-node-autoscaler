@@ -1,0 +1,165 @@
+{{- if not .Values.image.repository }}
+{{- fail "external-node-autoscaler: image.repository is required — the published chart sets it; from a git checkout use `make autoscaler`" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "external-node-autoscaler.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "external-node-autoscaler.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # Recreate, never RollingUpdate: the reconcile loop is not concurrency-safe.
+  # Two operators overlapping during a rollout would double-provision OVH
+  # machines and race each other's peering handshakes.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "external-node-autoscaler.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Restart when the fleet changes: providers and pools are read once at
+        # startup, so without this a `helm upgrade` that adds a pool or switches
+        # provider would leave the old fleet running with no sign of it.
+        #
+        # The provisioning script needs no annotation here — it ships inside the
+        # image (providers/provision.sh), so changing it is `make image`,
+        # which rolls the pod on its own.
+        checksum/provider: {{ include (print $.Template.BasePath "/configmap-provider-config.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "external-node-autoscaler.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "external-node-autoscaler.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: autoscaler
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Provider credentials, whatever they happen to be called. envFrom
+          # rather than named secretKeyRefs on purpose: the chart must not know
+          # that OVH spells them OVH_APPLICATION_KEY, or adding a provider would
+          # mean editing this file. Every key in the secret becomes an env var.
+          #
+          # One secret per provider, and that is the limit: env vars are a flat
+          # namespace, so two entries of the same provider type would collide.
+          # The pod will not start until these secrets exist.
+          envFrom:
+            {{- range .Values.providers }}
+            - secretRef:
+                name: {{ required (printf "provider %s needs a credentialsSecret" .name) .credentialsSecret }}
+            {{- end }}
+          env:
+            # The operator creates Secrets and mints tokens in its own
+            # namespace, and derives tenant namespaces from machine names.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: FLEET_CONFIG_FILE
+              value: /provider/fleet.yaml
+            - name: LOG_LEVEL
+              value: {{ .Values.config.logLevel | quote }}
+            - name: INTERVAL_S
+              value: {{ .Values.config.intervalSeconds | quote }}
+            - name: WATCH_NAMESPACES
+              value: {{ .Values.config.watchNamespaces | quote }}
+            - name: CONSUMER_CLUSTER_ID
+              value: {{ .Values.config.consumerClusterId | quote }}
+            - name: LIQO_VERSION
+              value: {{ .Values.config.liqoVersion | quote }}
+            - name: LIQO_NAMESPACE
+              value: {{ .Values.config.liqoNamespace | quote }}
+            - name: PEER_TIMEOUT
+              value: {{ .Values.config.peerTimeout | quote }}
+            - name: STUCK_POD_SECONDS
+              value: {{ .Values.config.stuckPodSeconds | quote }}
+            - name: ABORT_BLOCKED_PEERING
+              value: {{ .Values.config.abortBlockedPeering | quote }}
+            - name: BLOCKED_RETRY_SECONDS
+              value: {{ .Values.config.blockedRetrySeconds | quote }}
+            # How long to wait on a rented machine's API before calling it
+            # not-ready. A booting machine has ufw set to DROP, so an
+            # unanswered probe spends the whole budget — keep it well under
+            # intervalSeconds.
+            - name: PROBE_TIMEOUT_S
+              value: {{ .Values.config.probeTimeoutSeconds | quote }}
+            # Operator escape hatch: `make recycle MACHINE=...` writes a key
+            # here and the next pass reaps that machine regardless of timers.
+            - name: CONDEMNED_CONFIGMAP
+              value: {{ include "external-node-autoscaler.fullname" . }}-condemned
+            - name: NAME_PREFIX
+              value: {{ .Values.config.namePrefix | quote }}
+            # Newline-separated; toJson escapes them so the YAML scalar stays
+            # on one line and the container still sees real newlines.
+            - name: SSH_PUBLIC_KEYS
+              value: {{ join "\n" .Values.config.sshPublicKeys | toJson }}
+            - name: HUB_EGRESS_IPS
+              value: {{ .Values.config.hubEgressIps | quote }}
+            - name: MAX_MACHINES
+              value: {{ .Values.config.maxMachines | quote }}
+            # Rent nothing, release everything. Overrides per-pool minMachines,
+            # which would otherwise hold a warm pool alive past the hub.
+            - name: DRAIN
+              value: {{ .Values.config.drain | default false | quote }}
+            - name: IDLE_SECONDS
+              value: {{ .Values.config.idleSeconds | quote }}
+            {{- if lt (int .Values.config.deadSeconds) 300 }}
+            {{- fail "config.deadSeconds must stay above the hub's 300s not-ready eviction — see values.yaml" }}
+            {{- end }}
+            - name: DEAD_SECONDS
+              value: {{ .Values.config.deadSeconds | quote }}
+            - name: BOOT_SECONDS
+              value: {{ .Values.config.bootSeconds | quote }}
+            - name: MISSING_CONFIRM_SECONDS
+              value: {{ .Values.config.missingConfirmSeconds | quote }}
+          volumeMounts:
+            - name: provider
+              mountPath: /provider
+              readOnly: true
+            # Root filesystem is read-only; liqoctl and the operator both write
+            # kubeconfigs here, so /tmp must be writable.
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: provider
+          configMap:
+            name: {{ include "external-node-autoscaler.fullname" . }}-provider
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+

@@ -1,0 +1,28 @@
+# Python bytecode. `src/__pycache__` was committed once,
+# from running the operator or the validator locally; this stops the next one.
+__pycache__/
+*.py[cod]
+
+# Local test virtualenv, created on demand by `make test`. The operator's
+# dependencies (kubernetes, pyyaml, each provider's client) are not worth
+# installing into a global interpreter to run a unit suite.
+.venv/
+
+# --- from the experiment harness -------------------------------------------
+# Path-agnostic on purpose, so they apply wherever the harness sits.
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+crash.log
+
+# Local, environment-specific chart values (never secret, but never shared)
+**/values.local.yaml
+
+# Kubeconfigs — the K3s one in particular is a credential
+k3s.yaml
+*.kubeconfig
+kubeconfig
